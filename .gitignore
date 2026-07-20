@@ -1,0 +1,16 @@
+# Data & weights
+data/
+*.pt
+*.onnx
+*.engine
+anti_uav_yolo/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# OS
+.DS_Store
