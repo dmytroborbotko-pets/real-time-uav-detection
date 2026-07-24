@@ -1,5 +1,6 @@
 # Data & weights
 data/
+Anti-UAV-RGBT
 *.pt
 *.onnx
 *.engine
