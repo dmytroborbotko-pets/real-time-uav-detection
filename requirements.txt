@@ -1,7 +1,7 @@
 # Core
 ultralytics>=8.2.0
-torch>=2.2.0,<2.5.0
-torchvision>=0.17.0,<0.20.0
+torch>=2.5.0
+torchvision>=0.20.0
 opencv-python>=4.9.0
 numpy>=1.21.0,<1.25.0
 matplotlib>=3.7.0,<3.8.0
