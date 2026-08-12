@@ -1,0 +1,7 @@
+names:
+  0: uav
+nc: 1
+path: /kaggle/input/datasets/borbotkodmytro/yolo-uav-detection-dataset/yolo_dataset
+test: images/test
+train: images/train
+val: images/val

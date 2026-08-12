@@ -5,6 +5,7 @@ Anti-UAV-RGBT
 *.onnx
 *.engine
 anti_uav_yolo/
+*predict*
 
 # Python
 __pycache__/
