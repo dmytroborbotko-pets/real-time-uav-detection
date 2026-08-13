@@ -1,101 +1,198 @@
-# Anti-UAV RGBT: Real-Time Detection & Tracking
+# Anti-UAV RGBT: real-time detection and tracking
 
-## Day 1
+Detection and tracking of drones in infrared video: a fine-tuned YOLO11s
+detector with ByteTrack, an attribute-driven failure analysis, and a browser prototype that runs
+the model on-device.
 
-> **Відоме обмеження:** розбиття на val використовує ті самі відео, що й train, тому метрики на val будуть завищеними відносно реальної узагальнювальної здатності моделі.
+## Prototype: live drone tracking in the browser (works on iPhone)
 
-### Динамічний stride для нарізки кадрів
+This is a working prototype, not a production-ready system. The "Intentionally unoptimized
+baseline" section below lists exactly what is still missing.
 
-Доопрацював `framecut.py`: додав автоматичний підбір кроку (stride) нарізки кадрів для кожного відео окремо, щоб зменшити загальний обсяг тренувального датасету при локальному запуску без втрати інформативності кадрів.
+Demo video: https://drive.google.com/drive/folders/1oOzKJ20MehNSpWIXmN61-6g8Veac3kq0
 
-**Обґрунтування.** Джерельне відео знято з частотою 25 FPS, тому сусідні кадри майже ідентичні. Щоб уникнути надлишкової нарізки, крок підбирається окремо для кожного відео за медіанним IoU між кадром `t` і `t+N`, обчисленим по GT-анотаціях.
+The fine-tuned detector runs entirely client-side in the browser, with no inference server
+involved. Point an iPhone camera at a screen playing infrared drone footage.
 
-**Результати запуску на train-датасеті:**
+- The model is exported to ONNX with NMS baked directly into the graph
+  (`notebooks/06_onnx_export.ipynb`), so the browser only does box-coordinate math. There is no
+  NMS or IoU code on the JS side.
+- It runs on [ONNX Runtime Web](https://onnxruntime.ai/docs/tutorials/web/): WebGPU with a WASM
+  fallback, picked automatically at load time.
+- Letterbox preprocessing matches the training `imgsz`. The FPS counter on screen reports a
+  measured number rather than a spec-sheet claim.
+- Measured at about 24 FPS on an M1 Pro desktop through the WebGPU backend, and confirmed
+  working live on an actual iPhone (Safari, rear camera, over a tunnel) with stable tracking.
+- Full technical write-up and run instructions: [`web/README-web.md`](web/README-web.md).
 
-| Показник | Значення |
+### Intentionally unoptimized baseline
+
+This was the fastest route to something that works end to end, not to something that works well:
+
+- Full `imgsz=640`, with no INT8 quantization or resolution tuning yet.
+- No tracker in the browser. Every frame is an independent detection with no persistent track
+  IDs, unlike the Python-side ByteTrack integration described below.
+- Training only ever touched infrared, so pointing a live RGB daylight camera at the sky finds
+  nothing. That is by design (see Known limitations).
+- A browser page rather than a native app, so there is no CoreML or Apple Neural Engine
+  acceleration yet.
+- A 38MB ONNX model served as a static file, without a CDN or edge caching.
+
+### What comes next
+
+Concrete next steps, roughly in the order I would tackle them:
+
+1. INT8 quantization plus an accuracy/speed tradeoff benchmark
+   (`model.export(..., quantize=8)`). The easiest win available before touching input resolution.
+2. A native iOS app via CoreML and the Apple Neural Engine, to measure the real ANE speedup over
+   WebGPU and WASM. Probably the largest single lever for genuinely real-time inference
+   on-device.
+3. A lightweight tracker in JS (IoU plus Kalman, or a ByteTrack port) so detections persist as
+   tracked objects with stable IDs across frames, matching the Python-side pipeline instead of
+   detecting independently on every frame.
+4. Fine-tuning on the dataset's visible/RGB modality, which is present in Anti-UAV-RGBT but
+   currently unused, to support ordinary daylight cameras.
+5. PWA packaging with offline model caching through a service worker, for an installable and
+   more resilient mobile experience.
+6. A server-assisted hybrid fallback that streams to a GPU backend over WebSocket when the
+   on-device model is too slow for the hardware, and falls back to on-device otherwise.
+
+---
+
+## Problem statement
+
+Detect and track small, low-contrast aerial targets (drones) in infrared video under motion
+blur, thermal crossover with the background, and occlusion, with an eye toward edge-oriented
+deployment rather than a purely offline benchmark exercise. Built on the
+[Anti-UAV-RGBT](https://github.com/ZhaoJ9014/Anti-UAV) benchmark dataset.
+
+## Dataset and EDA
+
+Source video runs at 25 FPS, so adjacent frames are near duplicates. `framecut.py` uses an
+adaptive per-video stride, chosen from the median IoU between frame `t` and `t+N` against the GT
+annotations, which shrinks the dataset without losing informative frames.
+
+| Metric | Value |
 | --- | --- |
-| Послідовностей у train | 160 (офіційний спліт) |
-| Кадрів у джерелі | 149 528 |
-| Кадрів після субсемплінгу | ~15 800 (10.6%) |
-| Негативів (кадри без цілі) | 1 160 → 6.8% |
-| Stride (min / med / max) | 5 / 10 / 50 |
+| Train sequences | 160 (official split) |
+| Source frames | 149,528 |
+| Frames after subsampling | ~15,800 (10.6%) |
+| Negative frames (no target) | 1,160 → 6.8% |
+| Stride (min / median / max) | 5 / 10 / 50 |
 | Median IoU (p10 / p50 / p90) | 0.01 / 0.17 / 0.32 |
 
-### Конвертація в YOLO-формат
+`src/dataset.py` converts the sampled frames into a YOLO-format detection dataset (images,
+labels, and `data.yaml`). See `notebooks/01_eda.ipynb`.
 
-Додав скрипт `src/dataset.py`, який перетворює нарізані кадри train та val на YOLO-сумісний датасет (зображення + анотації + `data.yaml`), готовий для тренування моделі детекції.
+## Detection model: training and a data leakage bug
 
-## Day 2
-Взяв yolo11s, зробив файн тюн на 30 епох. 
+The first fine-tune was YOLO11s, 30 epochs, Adam. Validation metrics looked excellent, but
+inspecting real footage showed the detector badly missing drones whenever any background was
+present; it only worked cleanly on near-empty backgrounds. The cause is called out in the
+dataset's own documentation: the original train/val split leaks data. Clips from the same
+recording session (same background, same drone, same trajectory) end up on both sides of the
+split, so validation metrics were measuring memorization rather than generalization.
 
-|epoch|time   |train/box_loss|train/cls_loss|train/dfl_loss|metrics/precision(B)|metrics/recall(B)|metrics/mAP50(B)|metrics/mAP50-95(B)|val/box_loss|val/cls_loss|val/dfl_loss|lr/pg0    |lr/pg1    |lr/pg2    |
-|-----|-------|--------------|--------------|--------------|--------------------|-----------------|----------------|-------------------|------------|------------|------------|----------|----------|----------|
-|1    |1630.26|1.70973       |0.9595        |1.24355       |0.89048             |0.76477          |0.81197         |0.33262            |2.07667     |1.25068     |1.43541     |0.00333016|0.00333016|0.0700285 |
-|2    |3229.72|1.64701       |0.8547        |1.21403       |0.95349             |0.93785          |0.95271         |0.4828             |1.5738      |1.039       |1.18077     |0.0064436 |0.0064436 |0.0398086 |
-|3    |4832.15|1.62354       |0.80594       |1.1993        |0.90798             |0.89636          |0.90111         |0.38629            |1.88718     |1.32892     |1.34243     |0.00933704|0.00933704|0.00936875|
-|4    |6455.76|1.59239       |0.76104       |1.17983       |0.97742             |0.94914          |0.97014         |0.53097            |1.52411     |0.84267     |1.15444     |0.00901   |0.00901   |0.00901   |
-|5    |8072.79|1.56776       |0.73849       |1.16484       |0.97204             |0.94896          |0.97081         |0.53152            |1.47876     |0.72129     |1.13078     |0.00868   |0.00868   |0.00868   |
-|6    |9689.42|1.54118       |0.70871       |1.15597       |0.97188             |0.94697          |0.96919         |0.54482            |1.4731      |0.79791     |1.12827     |0.00835   |0.00835   |0.00835   |
-|7    |11289.8|1.52929       |0.69658       |1.15022       |0.97246             |0.94585          |0.96549         |0.54299            |1.46355     |0.72164     |1.12701     |0.00802   |0.00802   |0.00802   |
-|8    |12877.9|1.51876       |0.67957       |1.14739       |0.97596             |0.96197          |0.97562         |0.55084            |1.46133     |0.76509     |1.11716     |0.00769   |0.00769   |0.00769   |
-|9    |14516.4|1.50524       |0.66711       |1.14303       |0.98613             |0.96309          |0.97887         |0.55785            |1.43439     |0.7071      |1.10826     |0.00736   |0.00736   |0.00736   |
-|10   |16134.5|1.49777       |0.66252       |1.1424        |0.98656             |0.96396          |0.97782         |0.56133            |1.42577     |0.59222     |1.1034      |0.00703   |0.00703   |0.00703   |
-|11   |17719.5|1.48436       |0.64821       |1.13666       |0.98451             |0.96145          |0.97766         |0.54323            |1.50687     |0.7318      |1.13271     |0.0067    |0.0067    |0.0067    |
-|12   |19304.8|1.47673       |0.64007       |1.13177       |0.98588             |0.96545          |0.97797         |0.56198            |1.42377     |0.60355     |1.10587     |0.00637   |0.00637   |0.00637   |
-|13   |20892.1|1.46731       |0.62961       |1.12299       |0.99026             |0.96807          |0.97992         |0.56776            |1.42593     |0.60885     |1.10644     |0.00604   |0.00604   |0.00604   |
-|14   |22479  |1.46021       |0.62355       |1.12417       |0.98772             |0.97135          |0.98096         |0.56721            |1.41976     |0.62141     |1.1         |0.00571   |0.00571   |0.00571   |
-|15   |24065.8|1.462         |0.61524       |1.12614       |0.98737             |0.96874          |0.98034         |0.56616            |1.41271     |0.60412     |1.09777     |0.00538   |0.00538   |0.00538   |
-|16   |25650.5|1.44488       |0.60423       |1.11488       |0.985               |0.97295          |0.98133         |0.56546            |1.42342     |0.57919     |1.10396     |0.00505   |0.00505   |0.00505   |
-|17   |27241.2|1.42771       |0.60019       |1.11402       |0.98846             |0.97255          |0.98139         |0.56761            |1.41805     |0.56275     |1.09929     |0.00472   |0.00472   |0.00472   |
-|18   |28826.4|1.43137       |0.59537       |1.1143        |0.98797             |0.97261          |0.98152         |0.56968            |1.40369     |0.60204     |1.09356     |0.00439   |0.00439   |0.00439   |
-|19   |30410.9|1.43706       |0.5928        |1.11628       |0.98945             |0.97479          |0.9816          |0.57252            |1.40452     |0.57208     |1.09342     |0.00406   |0.00406   |0.00406   |
-|20   |31993.7|1.41559       |0.57939       |1.10659       |0.98772             |0.97348          |0.98139         |0.57321            |1.39562     |0.56411     |1.08726     |0.00373   |0.00373   |0.00373   |
-|21   |33567.6|1.40696       |0.54772       |1.17145       |0.98928             |0.97554          |0.98171         |0.57608            |1.39619     |0.53183     |1.09082     |0.0034    |0.0034    |0.0034    |
-|22   |35137.5|1.39947       |0.54015       |1.1654        |0.99152             |0.97503          |0.98175         |0.57752            |1.39221     |0.53839     |1.09072     |0.00307   |0.00307   |0.00307   |
-|23   |36707.2|1.39129       |0.53374       |1.15958       |0.98979             |0.97721          |0.98572         |0.58151            |1.38082     |0.53366     |1.08606     |0.00274   |0.00274   |0.00274   |
-|24   |38280  |1.37808       |0.52265       |1.15985       |0.9902              |0.97469          |0.98153         |0.5796             |1.3833      |0.52674     |1.08488     |0.00241   |0.00241   |0.00241   |
-|25   |39856.7|1.3748        |0.51795       |1.15537       |0.98922             |0.97684          |0.98168         |0.58147            |1.37304     |0.52091     |1.08074     |0.00208   |0.00208   |0.00208   |
-|26   |41437.4|1.36797       |0.51018       |1.15123       |0.99016             |0.97728          |0.98183         |0.58163            |1.37456     |0.5125      |1.08234     |0.00175   |0.00175   |0.00175   |
-|27   |43017  |1.35874       |0.50111       |1.14799       |0.99162             |0.97672          |0.9821          |0.58463            |1.36805     |0.51459     |1.08074     |0.00142   |0.00142   |0.00142   |
-|28   |44585.5|1.34798       |0.49183       |1.14476       |0.99084             |0.97654          |0.98195         |0.58076            |1.37686     |0.50891     |1.08346     |0.00109   |0.00109   |0.00109   |
-|29   |46172.9|1.34159       |0.48819       |1.13927       |0.99041             |0.9772           |0.98187         |0.5857             |1.36941     |0.5066      |1.08063     |0.00076   |0.00076   |0.00076   |
-|30   |47755.4|1.33532       |0.48157       |1.13751       |0.99088             |0.97722          |0.98179         |0.58683            |1.36467     |0.50883     |1.07997     |0.00043   |0.00043   |0.00043   |
+`src/resplit_by_session.py` fixes this by regrouping every sequence by its recording session
+(`YYYYMMDD_HHMMSS_N`) and assigning each session wholly to train or val, so no session appears in
+both. The retrain ran on Kaggle with tuned hyperparameters: Adam replaced by SGD (better suited
+to small objects), a 100-epoch budget with 15-epoch early-stop patience, and mosaic/mixup
+augmentation for small-object and cloud-background robustness.
 
-у резульаті дотренування на 30 епох виявив дуже хороші результати по метриках, але фактичні спостереження показали жахливу детекцію дронів на усіх випадках, коли присутній задній фон, а гарна детекція тільки у випадках відсутності фону. Одна з очевидних і основних проблем була в тому, що, як зазначається і в описі самомого датасету, дані трейн і валідаційної вибірки пересікаються і відповідно відбувається витік даних.
+| Run | Precision | Recall | mAP50 | mAP50-95 | Note |
+| --- | --- | --- | --- | --- | --- |
+| Initial (30 epochs, Adam, leaky split) | 0.991 | 0.977 | 0.982 | 0.587 | Best numbers on paper, visibly worse in practice |
+| Retrained (SGD, session-disjoint split) | 0.978 | 0.927 | 0.962 | 0.509 | Lower numbers, but trustworthy. Held-out test performance is in the failure analysis below |
 
-я прийняв рішення по-перше змінити конфігурацію тренування і перенести його в кагл для пришвидшення тренування. змінив оптимайзер Adam на SGD через те, що другий краще працює для дрібних обʼєктів. Також збільшив кількість епох до 100, але поставив поріг 15 епох без змін для зупинки навчання — зрештою модель досягла максимуму за 16 епох. Також додав аугментації: змішування кадрів для детекції дрібних деталей і змішування шарів для кращої детекції на фоні хмар. Також перед початком нового тренування я перемішав тренувальні і валідаційні виірки за сесіями, щоб уникнути пересікання і забезпечити унікальність, а у результаті чесніші метрики.
+Full per-epoch logs: `notebooks/02_train.ipynb` (initial run), `notebooks/03_opt_train.ipynb`
+(retrain).
 
-Результати: 
-|   epoch |      time |   train/box_loss |   train/cls_loss |   train/dfl_loss |   metrics/precision(B) |   metrics/recall(B) |   metrics/mAP50(B) |   metrics/mAP50-95(B) |   val/box_loss |   val/cls_loss |   val/dfl_loss |     lr/pg0 |     lr/pg1 |    lr/pg2 |
-|--------:|----------:|-----------------:|-----------------:|-----------------:|-----------------------:|--------------------:|-------------------:|----------------------:|---------------:|---------------:|---------------:|-----------:|-----------:|----------:|
-|       1 |   376.832 |          1.54065 |          0.96694 |          1.0945  |                0.94554 |             0.90662 |            0.94856 |               0.47158 |        1.71479 |        0.77207 |        1.08328 | 0.00333129 | 0.00333129 | 0.0700184 |
-|       2 |   712.823 |          1.4851  |          0.70616 |          1.07948 |                0.96783 |             0.90325 |            0.94442 |               0.47903 |        1.70965 |        0.76581 |        1.1011  | 0.00659865 | 0.00659865 | 0.0399524 |
-|       3 |  1048.33  |          1.47573 |          0.70125 |          1.10023 |                0.96    |             0.88761 |            0.92919 |               0.47011 |        1.75593 |        0.76093 |        1.11192 | 0.0098     | 0.0098     | 0.0098204 |
-|       4 |  1387.26  |          1.45375 |          0.66919 |          1.11233 |                0.9628  |             0.89682 |            0.94834 |               0.47807 |        1.70987 |        0.73138 |        1.11932 | 0.009703   | 0.009703   | 0.009703  |
-|       5 |  1722.16  |          1.42807 |          0.63066 |          1.1076  |                0.96508 |             0.92017 |            0.95521 |               0.48858 |        1.68446 |        0.70052 |        1.10627 | 0.009604   | 0.009604   | 0.009604  |
-|       6 |  2061.84  |          1.41313 |          0.61012 |          1.10425 |                0.97242 |             0.90715 |            0.9543  |               0.49013 |        1.67598 |        0.67321 |        1.10523 | 0.009505   | 0.009505   | 0.009505  |
-|       7 |  2408.75  |          1.40022 |          0.59832 |          1.09676 |                0.96674 |             0.91291 |            0.95251 |               0.48491 |        1.68199 |        0.67074 |        1.0997  | 0.009406   | 0.009406   | 0.009406  |
-|       8 |  2755.51  |          1.37995 |          0.58395 |          1.0883  |                0.97548 |             0.91331 |            0.95606 |               0.4967  |        1.65501 |        0.6473  |        1.08827 | 0.009307   | 0.009307   | 0.009307  |
-|       9 |  3095.7   |          1.37255 |          0.57374 |          1.08718 |                0.97741 |             0.9247  |            0.95949 |               0.50174 |        1.62033 |        0.63385 |        1.07775 | 0.009208   | 0.009208   | 0.009208  |
-|      10 |  3435.71  |          1.36118 |          0.56422 |          1.08416 |                0.97141 |             0.93434 |            0.95718 |               0.50064 |        1.63551 |        0.62125 |        1.08548 | 0.009109   | 0.009109   | 0.009109  |
-|      11 |  3773.44  |          1.36054 |          0.56073 |          1.0831  |                0.97048 |             0.93983 |            0.96457 |               0.49812 |        1.64864 |        0.60351 |        1.09046 | 0.00901    | 0.00901    | 0.00901   |
-|      12 |  4123.2   |          1.35103 |          0.55614 |          1.07898 |                0.97605 |             0.94055 |            0.96618 |               0.4963  |        1.66401 |        0.61093 |        1.09127 | 0.008911   | 0.008911   | 0.008911  |
-|      13 |  4473.27  |          1.34847 |          0.55156 |          1.07736 |                0.98454 |             0.91662 |            0.95428 |               0.50314 |        1.6407  |        0.6609  |        1.08445 | 0.008812   | 0.008812   | 0.008812  |
-|      14 |  4848.31  |          1.33696 |          0.54337 |          1.07396 |                0.972   |             0.93252 |            0.9647  |               0.5015  |        1.6404  |        0.60426 |        1.08329 | 0.008713   | 0.008713   | 0.008713  |
-|      15 |  5195.71  |          1.3347  |          0.542   |          1.07171 |                0.97793 |             0.92205 |            0.95782 |               0.49841 |        1.65544 |        0.61623 |        1.08674 | 0.008614   | 0.008614   | 0.008614  |
-|      16 |  5558.64  |          1.33225 |          0.53815 |          1.07173 |                0.97733 |             0.92697 |            0.96324 |               0.50929 |        1.62969 |        0.62087 |        1.0795  | 0.008515   | 0.008515   | 0.008515  |
-|      17 |  5909.23  |          1.32916 |          0.53289 |          1.07093 |                0.97609 |             0.92676 |            0.96143 |               0.49904 |        1.64599 |        0.61453 |        1.08578 | 0.008416   | 0.008416   | 0.008416  |
-|      18 |  6264.95  |          1.32676 |          0.53045 |          1.06792 |                0.97895 |             0.92142 |            0.95843 |               0.49982 |        1.6456  |        0.63215 |        1.08345 | 0.008317   | 0.008317   | 0.008317  |
-|      19 |  6620.84  |          1.3214  |          0.52508 |          1.06649 |                0.9722  |             0.93504 |            0.96417 |               0.50706 |        1.64529 |        0.59475 |        1.08618 | 0.008218   | 0.008218   | 0.008218  |
-|      20 |  6985.07  |          1.32057 |          0.52793 |          1.06677 |                0.97917 |             0.91917 |            0.95368 |               0.49712 |        1.6501  |        0.62857 |        1.08474 | 0.008119   | 0.008119   | 0.008119  |
-|      21 |  7336.9   |          1.31324 |          0.52501 |          1.06245 |                0.9748  |             0.92672 |            0.95582 |               0.49854 |        1.66604 |        0.60214 |        1.08841 | 0.00802    | 0.00802    | 0.00802   |
-|      22 |  7739.83  |          1.31514 |          0.52329 |          1.06369 |                0.97838 |             0.9245  |            0.95892 |               0.49343 |        1.66838 |        0.60464 |        1.09068 | 0.007921   | 0.007921   | 0.007921  |
-|      23 |  8100.9   |          1.30703 |          0.51973 |          1.06306 |                0.97656 |             0.92785 |            0.96082 |               0.50181 |        1.65936 |        0.60372 |        1.08951 | 0.007822   | 0.007822   | 0.007822  |
-|      24 |  8478.51  |          1.30727 |          0.51815 |          1.06222 |                0.97296 |             0.92962 |            0.95627 |               0.50201 |        1.65743 |        0.60598 |        1.08894 | 0.007723   | 0.007723   | 0.007723  |
-|      25 |  8835.78  |          1.30568 |          0.51865 |          1.05858 |                0.97208 |             0.93116 |            0.95576 |               0.49626 |        1.65589 |        0.59948 |        1.08798 | 0.007624   | 0.007624   | 0.007624  |
-|      26 |  9188.19  |          1.30265 |          0.51301 |          1.05696 |                0.98085 |             0.92293 |            0.95528 |               0.49951 |        1.65968 |        0.61425 |        1.0861  | 0.007525   | 0.007525   | 0.007525  |
-|      27 |  9538.8   |          1.29655 |          0.5091  |          1.05696 |                0.98074 |             0.9218  |            0.95548 |               0.50322 |        1.64843 |        0.61076 |        1.08346 | 0.007426   | 0.007426   | 0.007426  |
-|      28 |  9896.65  |          1.29833 |          0.50893 |          1.05458 |                0.97731 |             0.92798 |            0.95671 |               0.49877 |        1.65207 |        0.60486 |        1.08422 | 0.007327   | 0.007327   | 0.007327  |
-|      29 | 10248.1   |          1.29441 |          0.50895 |          1.05819 |                0.97752 |             0.931   |            0.96211 |               0.49787 |        1.6507  |        0.59412 |        1.08412 | 0.007228   | 0.007228   | 0.007228  |
-|      30 | 10645.2   |          1.28391 |          0.50505 |          1.0502  |                0.97846 |             0.93189 |            0.96213 |               0.49963 |        1.64503 |        0.59558 |        1.08182 | 0.007129   | 0.007129   | 0.007129  |
-|      31 | 11000.3   |          1.28738 |          0.50557 |          1.0528  |                0.97793 |             0.92793 |            0.96172 |               0.50136 |        1.64239 |        0.59656 |        1.08101 | 0.00703    | 0.00703    | 0.00703   |
+## Tracking (ByteTrack) and metrics
+
+The retrained detector feeds [ByteTrack](https://arxiv.org/abs/2110.06864) (through Ultralytics'
+`model.track(...)`) for identity persistence across frames. Evaluation used a held-out test
+sequence, `motmetrics`, and the official Anti-UAV state-accuracy (mSA) formula:
+
+| Metric | Value |
+| --- | --- |
+| MOTA | 0.933 |
+| IDF1 | 0.730 |
+| ID switches | 10 |
+| mSA (single sequence) | 74.4% |
+
+Demo video with tracked boxes: `assets/20190926_134054_1_1_infrared_tracked.mp4`. See
+`notebooks/04_tracker.ipynb`.
+
+## Failure analysis
+
+Detection ran over the full test split (15,946 sampled frames across 91 sequences), with
+outcomes grouped by the dataset's official challenge attributes (`label_new/`: `FM`, `LI`, `LR`,
+`OC`, `OV`, `SV`, `TC`).
+
+Overall: precision 98.8%, recall 87.3%, mean IoU 68.1%.
+
+This is almost entirely a recall problem rather than a hallucination problem. Precision stays
+between 93.9% and 99.3% across every attribute, with only 152 false positives out of 15,946
+frames (about 1%). Of those false positives, 139 out of 152 (91.4%) come from `OV`-tagged
+(out-of-view) sequences. The gallery below confirms visually that these are the drone entering
+or leaving frame at the label's visibility boundary, not random false alarms on background
+clutter.
+
+The two measurably worst attributes are `SV` (scale variation, recall 5.3pp below overall) and
+`TC` (thermal crossover, 5.1pp below). Both also have the lowest mean IoU (63.1% and 64.0%), so
+even successful detections are localized less precisely. My hypotheses: with `SV`, rapid scale
+change pushes the target outside the range the detector learned confidently; with `TC`, the
+target's thermal signature blends into the background, which is a sensor-level limit rather than
+an architecture gap.
+
+Counter-intuitively, `LR`, `OC`, `OV` and `LI` all show higher recall than the overall baseline.
+The likely reason is that `label_new` tags are sequence-level rather than frame-level: a sequence
+tagged `OC` may contain only a few genuinely occluded frames among hundreds of easy ones, which
+dilutes the metric.
+
+![FP/FN gallery: GT in green, prediction in red, captioned with sequence attribute tags](assets/failure_gallery.png)
+
+Full test-set mSA across all 91 sequences, using the official penalized state-accuracy formula,
+is 63.6%. Published Protocol-I (zero-shot SOT) baselines from the Anti-UAV paper
+(arXiv:2101.08466, Table IV) for comparison:
+
+| Tracker | mSA (IR) |
+| --- | --- |
+| SiamFC | 11.02% |
+| MDNet | 15.44% |
+| ECO-HC | 14.76% |
+| SiamRPN++ | 16.46% |
+| **This project** | **63.6%** |
+
+This is not a like-for-like comparison. The published trackers are evaluated zero-shot (Protocol
+I, no training on Anti-UAV, initialized from a first-frame box), while this project trains on
+Anti-UAV (Protocol II) and runs per-frame detection rather than classic single-object tracking.
+The gap follows from that difference in setup and is not by itself evidence of a better method.
+
+Full breakdown, per-attribute table, and worst-sequence ranking:
+`notebooks/05_failure_analysis.ipynb`.
+
+## Known limitations
+
+- The train/val leakage fix works at the session level (`resplit_by_session.py`), but nobody has
+  independently re-audited it beyond that regrouping.
+- `label_new` challenge attributes are sequence-level rather than frame-level, which caps how
+  precisely the failure analysis can attribute individual frame failures to a specific condition
+  (see above). The `FM` and `SV` per-frame proxies computed from `gt_rect` deltas are
+  approximate, because the detection-metric evaluation runs on stride-subsampled frames rather
+  than truly adjacent ones. (The mSA evaluation above uses full, un-subsampled frames, so it is
+  unaffected by this.)
+- The detector is trained only on infrared frames, with no visible/RGB support (see the prototype
+  limitations above).
+
+## Repository structure
+
+```
+notebooks/         EDA, training, tracking, failure analysis, ONNX export (one notebook per stage)
+src/               reusable modules: dataset building, session resplitting, failure-analysis metrics
+web/               browser prototype: static page + exported ONNX model
+assets/            demo video, failure-analysis gallery, cached metric CSVs
+bytetrack/         ByteTrack tracker config
+runs/              training run artifacts and trained weights (large binaries, gitignored)
+Anti-UAV-RGBT/     dataset (gitignored, not part of this repo)
+```

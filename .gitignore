@@ -6,7 +6,6 @@ Anti-UAV-RGBT
 *.engine
 anti_uav_yolo/
 *predict*
-README-web.md
 
 # Python
 __pycache__/
