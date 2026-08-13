@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>UAV Tracker — live demo</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <h1>UAV Tracker</h1>
+  <p>YOLO11s, натренована на інфрачервоних кадрах Anti-UAV-RGBT</p>
+</header>
+
+<main>
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div class="controls">
+    <div class="mode-toggle">
+      <button id="mode-file" class="mode-btn active" type="button">Тестове відео</button>
+      <button id="mode-camera" class="mode-btn" type="button">Камера</button>
+    </div>
+    <button id="start" type="button">Старт</button>
+    <div class="stats">
+      <span id="backend">backend: —</span>
+      <span id="fps">FPS: —</span>
+    </div>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1/dist/ort.min.js" crossorigin="anonymous"></script>
+<script src="app.js"></script>
+</body>
+</html>
