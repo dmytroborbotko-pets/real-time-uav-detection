@@ -153,18 +153,8 @@ dilutes the metric.
 ![FP/FN gallery: GT in green, prediction in red, captioned with sequence attribute tags](assets/failure_gallery.png)
 
 Full test-set mSA across all 91 sequences, using the official penalized state-accuracy formula,
-is 63.6%. Published Protocol-I (zero-shot SOT) baselines from the Anti-UAV paper
-(arXiv:2101.08466, Table IV) for comparison:
-
-| Tracker | mSA (IR) |
-| --- | --- |
-| SiamFC | 11.02% |
-| MDNet | 15.44% |
-| ECO-HC | 14.76% |
-| SiamRPN++ | 16.46% |
-| **This project** | **63.6%** |
-
-This is not a like-for-like comparison. The published trackers are evaluated zero-shot (Protocol
+is 63.6%. But I cannot compare it with Published Protocol-I (zero-shot SOT) baselines from the Anti-UAV paper
+(arXiv:2101.08466, Table IV) because the published trackers are evaluated zero-shot (Protocol
 I, no training on Anti-UAV, initialized from a first-frame box), while this project trains on
 Anti-UAV (Protocol II) and runs per-frame detection rather than classic single-object tracking.
 The gap follows from that difference in setup and is not by itself evidence of a better method.
